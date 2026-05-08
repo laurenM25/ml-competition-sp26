@@ -1,0 +1,471 @@
+#%%
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+from itertools import product
+import os
+
+from features import (
+    FEATURE_COLUMNS, TARGET_COLUMN, FORWARD_HORIZON,
+    build_features, training_frame, prediction_frame,
+    load_sector_map, load_margin_features, load_fin_ind_feats,
+    add_sector_features, add_margin_features, add_quality_value_features,
+    add_market_regime_feature
+)
+from tweak_baseline import (
+    DATA_DIR, VAL_DAYS, EMBARGO_DAYS, MIN_STOCKS, MAX_WEIGHT,
+    rank_ic, build_portfolio
+)
+from score_submission import score_window
+
+# ------------------------------------------------------------------
+# param index lookup — used to extract the varied value automatically
+# ------------------------------------------------------------------
+PARAM_NAMES = ["n_estimators", "max_depth", "learning_rate",
+               "subsample", "colsample_bytree", "min_child_weight", "reg_lambda"]
+PARAM_IDX   = {name: i for i, name in enumerate(PARAM_NAMES)}
+
+
+def train_model(train_df, val_df, param_set):
+    n_estimators, max_depth, lr, subsample, colsample_bytree, min_child_weight, reg_lambda = param_set
+    model = xgb.XGBRegressor(
+        n_estimators=n_estimators, max_depth=max_depth, learning_rate=lr,
+        subsample=subsample, colsample_bytree=colsample_bytree,
+        min_child_weight=min_child_weight, reg_lambda=reg_lambda,
+        tree_method="hist", n_jobs=-1, early_stopping_rounds=30,
+    )
+    model.fit(
+        train_df[FEATURE_COLUMNS], train_df[TARGET_COLUMN],
+        eval_set=[(val_df[FEATURE_COLUMNS], val_df[TARGET_COLUMN])],
+        verbose=False,
+    )
+
+    """
+    importance = pd.Series(
+        model.feature_importances_,
+        index=FEATURE_COLUMNS
+    ).sort_values(ascending=False)
+    print(importance)
+    """
+    return model
+    
+
+
+def return_prices_df():
+    return pd.read_parquet(str(DATA_DIR / "prices.parquet"))
+
+
+def xgb_parameters_to_test(mode=0):
+    """Returns list of dicts: {params: tuple, group: str, varied_value: scalar}"""
+
+    BASELINE_TUPLE = (400, 5, 0.05, 0.8, 0.8, 10, 1.0)
+
+    def make(params, group, varied_value=None):
+        if varied_value is None:
+            idx = PARAM_IDX.get(group, None)
+            varied_value = params[idx] if idx is not None else group  # fall back to group name
+        return {"params": params, "group": group, "varied_value": varied_value}
+
+    baseline = make(BASELINE_TUPLE, "baseline")
+
+    if mode == 0:
+        return [baseline]
+
+    elif mode == 1:
+        return [
+            baseline,
+            # n_estimators
+            make((200, 5, 0.05, 0.8, 0.8, 10, 1.0), "n_estimators"),
+            make((300, 5, 0.05, 0.8, 0.8, 10, 1.0), "n_estimators"),
+            make((500, 5, 0.05, 0.8, 0.8, 10, 1.0), "n_estimators"),
+            make((600, 5, 0.05, 0.8, 0.8, 10, 1.0), "n_estimators"),
+            make((700, 5, 0.05, 0.8, 0.8, 10, 1.0), "n_estimators"),
+            # max_depth
+            make((400, 2, 0.05, 0.8, 0.8, 10, 1.0), "max_depth"),
+            make((400, 3, 0.05, 0.8, 0.8, 10, 1.0), "max_depth"),
+            make((400, 4, 0.05, 0.8, 0.8, 10, 1.0), "max_depth"),
+            make((400, 6, 0.05, 0.8, 0.8, 10, 1.0), "max_depth"),
+            make((400, 8, 0.05, 0.8, 0.8, 10, 1.0), "max_depth"),
+            # learning_rate
+            make((400, 5, 0.005, 0.8, 0.8, 10, 1.0), "learning_rate"),
+            make((400, 5, 0.01,  0.8, 0.8, 10, 1.0), "learning_rate"),
+            make((400, 5, 0.03,  0.8, 0.8, 10, 1.0), "learning_rate"),
+            make((400, 5, 0.10,  0.8, 0.8, 10, 1.0), "learning_rate"),
+            make((400, 5, 0.20,  0.8, 0.8, 10, 1.0), "learning_rate"),
+            # min_child_weight
+            make((400, 5, 0.05, 0.8, 0.8,  1, 1.0), "min_child_weight"),
+            make((400, 5, 0.05, 0.8, 0.8,  5, 1.0), "min_child_weight"),
+            make((400, 5, 0.05, 0.8, 0.8, 20, 1.0), "min_child_weight"),
+            make((400, 5, 0.05, 0.8, 0.8, 50, 1.0), "min_child_weight"),
+            make((400, 5, 0.05, 0.8, 0.8,100, 1.0), "min_child_weight"),
+            # reg_lambda
+            make((400, 5, 0.05, 0.8, 0.8, 10,  0.01), "reg_lambda"),
+            make((400, 5, 0.05, 0.8, 0.8, 10,  0.1 ), "reg_lambda"),
+            make((400, 5, 0.05, 0.8, 0.8, 10,  5.0 ), "reg_lambda"),
+            make((400, 5, 0.05, 0.8, 0.8, 10, 10.0 ), "reg_lambda"),
+            make((400, 5, 0.05, 0.8, 0.8, 10, 50.0 ), "reg_lambda"),
+            # subsample
+            make((400, 5, 0.05, 0.3, 0.8, 10, 1.0), "subsample"),
+            make((400, 5, 0.05, 0.5, 0.8, 10, 1.0), "subsample"),
+            make((400, 5, 0.05, 0.6, 0.8, 10, 1.0), "subsample"),
+            make((400, 5, 0.05, 0.9, 0.8, 10, 1.0), "subsample"),
+            make((400, 5, 0.05, 1.0, 0.8, 10, 1.0), "subsample"),
+            # colsample_bytree
+            make((400, 5, 0.05, 0.8, 0.3, 10, 1.0), "colsample_bytree"),
+            make((400, 5, 0.05, 0.8, 0.5, 10, 1.0), "colsample_bytree"),
+            make((400, 5, 0.05, 0.8, 0.6, 10, 1.0), "colsample_bytree"),
+            make((400, 5, 0.05, 0.8, 0.9, 10, 1.0), "colsample_bytree"),
+            make((400, 5, 0.05, 0.8, 1.0, 10, 1.0), "colsample_bytree"),
+        ]
+
+    elif mode == 2:
+        return [baseline] + [
+            make((400, 5, 0.05, 0.8, 0.8, v, 1.0), "min_child_weight")
+            for v in [3, 5, 8, 10, 15, 18, 25, 30, 35, 40, 45, 50, 52, 55, 58]
+        ]
+
+    elif mode == 3:
+        return [
+            baseline,
+            make((400, 5, 0.05, 0.3, 0.3, 10, 1.0), "subsample+colsample"),
+        ]
+
+    elif mode == 4:
+        return [baseline] + [
+            make((400, 5, 0.05, 0.8, 0.8, v, 1.0), "min_child_weight")
+            for v in [5, 20, 35, 50, 65, 75, 85, 100]
+        ] + [
+            make((400, 5, 0.05, 0.8, 0.8, 10, v), "reg_lambda")
+            for v in [20, 30, 50, 80, 100, 150, 180, 200]
+        ]
+
+    elif mode == 5:
+        return [
+            baseline,
+            make((400, 6, 0.05, 0.3, 0.3, 50, 18.0), "combined"),
+        ]
+    elif mode == 6: #testing for best combos of 3 parameters ->
+        subsample_vals  = [0.3, 0.5, 0.8]
+        colsample_vals  = [0.3, 0.5, 0.8]
+        lambda_vals     = [1.0, 10.0, 50.0]
+
+        combos = list(product(subsample_vals, colsample_vals, lambda_vals))
+
+        return [baseline] + [
+            make(
+                (400, 5, 0.05, ss, cs, 10, rl),
+                "grid_search",
+                varied_value=f"ss={ss}_cs={cs}_rl={rl}"
+            )
+            for ss, cs, rl in combos
+        ]
+    elif mode == 7: #finer search, now testing 2 parameter combos ->
+        subsample_vals = [0.4, 0.5, 0.6]
+        lambda_vals    = [5.0, 10.0, 20.0]
+        return [baseline] + [
+            make((400, 5, 0.05, ss, 0.3, 10, rl), "cs0.3_refined",
+                varied_value=f"ss={ss}_rl={rl}")
+            for ss, rl in product(subsample_vals, lambda_vals)
+        ]
+    elif mode == 8:
+        return [baseline] + [make((400, 5, 0.05, 0.5, 0.3, 10, 10.0), "final_parameters")]
+    
+    elif mode == 9: #adjusted search after adding new features, tweaking portfolio weighting
+        subsample_vals       = [0.5, 0.6, 0.8]      # avoid 0.3, too volatile
+        min_child_weight_vals = [10, 50, 100]
+        reg_lambda_vals      = [1.0, 10.0, 50.0]
+        
+        return [baseline] + [
+            make(
+                (400, 5, 0.05, ss, 0.3, mcw, rl),
+                "cs0.3_grid",
+                varied_value=f"ss={ss}_mcw={mcw}_rl={rl}"
+            )
+            for ss, mcw, rl in product(subsample_vals, min_child_weight_vals, reg_lambda_vals)
+        ]
+    elif mode == 10:
+        return [baseline] + [make((400, 5, 0.05, 0.5, 0.3, 50, 50.0), "final_parameters")]
+    elif mode == 11:
+        subsample_vals       = [0.4, 0.5, 0.6]
+        colsample_vals       = [0.3, 0.5, 0.6]
+        min_child_weight_vals = [10, 50, 100]
+        
+        return [baseline] + [
+            make(
+                (400, 5, 0.05, ss, cs, mcw, 1.0),
+                "fin_grid",
+                varied_value=f"ss={ss}_cs={cs}_mcw={mcw}"
+            )
+            for ss, cs, mcw in product(subsample_vals, colsample_vals, min_child_weight_vals)
+        ]
+    elif mode == 12:
+        return [baseline] + [
+            make((400, 5, 0.05, 0.8, 0.8, 10, 1.0), "baseline_confirm"),
+            make((400, 5, 0.05, 0.6, 0.8, 10, 1.0), "subsample_test"),
+            make((400, 5, 0.05, 0.8, 0.6, 10, 1.0), "colsample_test"),
+            make((400, 5, 0.05, 0.8, 0.8, 20, 1.0), "mcw_test"),
+            make((400, 5, 0.05, 0.8, 0.8, 10, 5.0), "lambda_test"),
+            make((400, 4, 0.05, 0.8, 0.8, 10, 1.0), "depth_test"),
+        ]
+    elif mode == 13:
+        return [baseline] + [
+            make((400, 6, 0.05, 0.8, 0.6, 10, 1.0), "better-windows-better-param-test")
+        ]
+    else:
+        raise ValueError(f"Unknown mode {mode}")
+
+
+def score_submission_f(start_date, end_date, prices, index_df):
+    """Score temp.csv against realized returns. Accepts pre-loaded prices/index."""
+    sub = pd.read_csv("temp.csv", dtype={"stock_code": str})
+    sub["stock_code"] = sub["stock_code"].str.zfill(6)
+    weights = sub.set_index("stock_code")["weight"].astype(float)
+    result = score_window(weights, prices, index_df,
+                          pd.Timestamp(start_date), pd.Timestamp(end_date))
+    return float(f"{result['excess_return']*100:+.3f}")
+
+
+def nearest_trading_date(as_of_str, panel):
+    """Snap a date string to the nearest trading date at or before it."""
+    as_of = pd.Timestamp(as_of_str)
+    trading_dates = np.sort(panel["date"].unique())
+    idx = int(np.searchsorted(trading_dates, np.datetime64(as_of), side="right")) - 1
+    return pd.Timestamp(trading_dates[max(0, idx)])
+
+
+def run_experiment(panel, top_k, xgb_param_dicts, test_windows,
+                   prices, index_df, a=0.45):
+    results = []
+
+    for win_i, (as_of, test_start, test_end) in enumerate(test_windows, 1):
+
+        # --- build train / val split ---
+        as_of_ts = pd.Timestamp(as_of)
+        trading_dates = np.sort(panel["date"].unique())
+        as_of_idx = int(np.searchsorted(trading_dates, np.datetime64(as_of_ts)))
+        cutoff_idx = max(0, as_of_idx - FORWARD_HORIZON)
+        train_cutoff = pd.Timestamp(trading_dates[cutoff_idx])
+
+        train_pool = training_frame(panel, max_date=train_cutoff)
+        all_dates = np.sort(train_pool["date"].unique())
+        val_start = pd.Timestamp(all_dates[-VAL_DAYS])
+        train_end = pd.Timestamp(all_dates[-(VAL_DAYS + EMBARGO_DAYS + 1)])
+        train_df = train_pool[train_pool["date"] <= train_end]
+        val_df   = train_pool[train_pool["date"] >= val_start]
+
+        # prediction date = nearest trading day at or before as_of
+        # pred_date = nearest_trading_date(as_of, panel)
+        # print(f"  as_of={as_of}, train_cutoff={train_cutoff.date()}, pred_date={pred_date.date()}")
+
+
+        for param_dict in xgb_param_dicts:
+            param_set    = param_dict["params"]
+            group        = param_dict["group"]
+            varied_value = param_dict["varied_value"]
+            
+            # print(f"  training model: group={group}, params={param_set}")
+            model = train_model(train_df, val_df, param_set)
+
+            preds = model.predict(val_df[FEATURE_COLUMNS])
+            ic = rank_ic(val_df[TARGET_COLUMN].values, preds, val_df["date"].values)
+
+            fresh_pred = prediction_frame(panel, as_of=as_of_ts).copy()
+            if fresh_pred.empty:
+                print(f"  [warn] empty pred frame for as_of={as_of}, skipping")
+                continue
+
+            fresh_pred["score"] = model.predict(fresh_pred[FEATURE_COLUMNS])
+            scores  = fresh_pred.set_index("stock_code")["score"]
+
+            """ TEST -- building portfolio with volatility-adjusted scoring
+            """
+            fresh_pred = fresh_pred.assign(score=model.predict(fresh_pred[FEATURE_COLUMNS]))
+            scores = fresh_pred.set_index("stock_code")["score"]
+            vols = fresh_pred.set_index("stock_code")["vol_20d"]
+            weights = build_portfolio(scores, a, vols=vols, top_k=top_k)
+
+            out = pd.DataFrame({"stock_code": weights.index, "weight": weights.values})
+            out.to_csv("temp.csv", index=False)
+
+            er = score_submission_f(test_start, test_end, prices, index_df)
+
+            results.append({
+                "as_of":        as_of,
+                "test_start":   test_start,
+                "test_end": test_end,
+                "ic":           ic,
+                "excess_return": er,
+                "top_k":        top_k,
+                "xgb_param":    param_set,
+                "param_group":  group,
+                "varied_value": varied_value,
+            })
+
+    return pd.DataFrame(results)
+
+
+def aggregate_results(results_df):
+
+    return (
+        results_df
+        .drop(columns=["as_of", "test_start"])
+        .groupby(["xgb_param", "param_group", "varied_value", "top_k"])
+        .agg(
+            ic_mean=("ic",           "mean"),
+            ic_std= ("ic",           "std"),
+            ic_min= ("ic",           "min"),
+            ic_max= ("ic",           "max"),
+            er_mean=("excess_return","mean"),
+            er_std= ("excess_return","std"),
+            er_min= ("excess_return","min"),
+            er_max= ("excess_return","max"),
+        )
+        .reset_index()
+    )
+
+
+
+def plot_results(averaged, baseline_group="baseline"):
+    """One row of subplots per non-baseline param group, IC and ER side by side."""
+
+    baseline_row = averaged[averaged["param_group"] == baseline_group]
+    baseline_ic  = baseline_row["ic_mean"].values[0]
+    baseline_er  = baseline_row["er_mean"].values[0]
+
+    groups = [g for g in averaged["param_group"].unique() if g != baseline_group]
+    if not groups:
+        print("Nothing to plot beyond baseline.")
+        return
+
+    fig, axes = plt.subplots(len(groups), 2,
+                             figsize=(13, len(groups) * 3.2),
+                             squeeze=False)
+    fig.suptitle("XGBoost parameter sensitivity", fontsize=14, y=1.01)
+
+    for row, group in enumerate(groups):
+        df = (averaged[averaged["param_group"] == group]
+              .sort_values("varied_value")
+              .reset_index(drop=True))
+
+        x_labels = df["varied_value"].astype(str).tolist()
+        x_pos    = np.arange(len(x_labels))
+
+        for col, (metric, std_col, label, baseline_val, color_hi, color_lo) in enumerate([
+            ("ic_mean",  "ic_std",  "Rank IC",          baseline_ic, "steelblue",  "#a8c8e8"),
+            ("er_mean",  "er_std",  "Excess return (%)", baseline_er, "seagreen",   "#8fca9f"),
+        ]):
+            ax = axes[row][col]
+            vals = df[metric].values
+            stds = df[std_col].values
+
+            bar_colors = [color_hi if v == vals.max() else color_lo for v in vals]
+            ax.bar(x_pos, vals, color=bar_colors, zorder=2)
+            ax.errorbar(x_pos, vals, yerr=stds,
+                        fmt="none", color="black", capsize=4, linewidth=1, zorder=3)
+
+            ax.axhline(baseline_val, color="red", linestyle="--",
+                       linewidth=1, label=f"baseline ({baseline_val:.3f})")
+
+            ax.set_title(f"{group} — {label}", fontsize=11)
+            ax.set_ylabel(label, fontsize=9)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(x_labels, fontsize=9)
+            ax.legend(fontsize=8)
+            ax.grid(axis="y", alpha=0.3, zorder=1)
+
+    plt.tight_layout()
+    plt.savefig("param_sensitivity.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print(">> Saved param_sensitivity.png")
+#%%
+
+def main():
+    prices   = return_prices_df()
+    #prices["date"] = pd.to_datetime(prices["date"])
+    index_df = pd.read_parquet(str(DATA_DIR / "index.parquet"))
+    index_df["date"] = pd.to_datetime(index_df["date"])
+
+    panel = build_features(prices)
+
+    include_other_features = True
+
+    test_windows = [
+        ("20260423", "20260428", "20260430"),
+        ("20260424", "20260427", "20260429"),
+        ("20260108", "20260114", "20260116"),
+        ("20251113", "20251119", "20251121"),
+        ("20251031", "20251105", "20251107"),
+        ("20250904", "20250910", "20250912"),
+        ("20250710", "20250716", "20250718"),
+        ("20250731", "20250806", "20250808"),
+    ]
+
+    #set mode (gives certain parameters to test)
+    mode = 13
+    xgb_params = xgb_parameters_to_test(mode=mode)
+    test_multiple_k = False
+
+    #ADD TO PANEL SECTOR FEATURES IF TRUE
+    if include_other_features:
+        sector_map = load_sector_map()
+        margin = load_margin_features()
+        fin_df = load_fin_ind_feats()
+        
+        panel = add_sector_features(panel, sector_map)
+        panel = add_margin_features(panel, margin)
+        panel = add_market_regime_feature(panel)
+        panel = add_quality_value_features(panel,fin_df=fin_df)
+        
+        print("success! added sector features. Confirming with column list:", panel.columns)
+
+    if not test_multiple_k: #testing just one k value
+        top_k      = 75
+
+        results_df = run_experiment(panel, top_k, xgb_params,
+                                    test_windows, prices, index_df)
+        averaged   = aggregate_results(results_df)
+
+        print(averaged.sort_values("ic_mean", ascending=False).to_string())
+
+        if (mode != 6):
+            plot_results(averaged)
+        if (mode in [6,7]):
+            averaged.sort_values("ic_mean", ascending=False).to_csv("tweaking_params/best-combo-params.csv", index=False)
+            print("output, sorted by er_mean descending")
+            print(averaged.sort_values("er_mean", ascending=False).to_string())
+            print("output, sorted by ic_mean descending")
+            print(averaged.sort_values("ic_mean", ascending=False).to_string())
+        elif (mode == 9):
+            averaged.sort_values("ic_mean", ascending=False).to_csv("tweaking_params/set3b-adjusted.csv", index=False)
+        elif (mode == 13):
+            bwbpt_df = results_df[results_df["param_group"] == "better-windows-better-param-test"]
+            print("columns of bwbpt_df:", bwbpt_df.columns)
+            print(bwbpt_df.drop(columns=["varied_value"]))
+            averaged.sort_values("ic_mean", ascending=False).to_csv("tweaking_params/May3-updated-windows-params.csv", index=False)
+
+    else: # testing multiple k values, e.g. mode == 8 or mode == 10
+        data_holder = []
+        k_values = [38, 50, 80, 100]
+        for row_idx, top_k in enumerate(k_values): 
+            print("running experiment for index ", row_idx, " of all top_k values to choose from.")
+            results_df = run_experiment(panel, top_k, xgb_params,
+                                        test_windows, prices, index_df)
+            averaged   = aggregate_results(results_df)
+            data_holder.append(averaged)
+        
+        combined = pd.concat(data_holder, ignore_index=True)
+        print(combined.sort_values("ic_mean", ascending=False).to_string())
+
+        out_path = Path(__file__).parent / "tweaking_params/topk_results.csv"
+        combined.sort_values(["top_k", "ic_mean"], ascending=[True, False]).to_csv(out_path, index=False)
+        print(f"Saved {len(combined)} rows to {out_path}")
+        
+
+
+main()
+
+# %%
